@@ -9,6 +9,7 @@ use crate::{
             adjustment_remove_coordinate,
             coordinate_from_index_with_lock,
             index_from_coordinate,
+            string_from_column_index,
         },
         range::{
             get_join_range,
@@ -976,6 +977,82 @@ pub fn adjustment_insert_formula_coordinate(
     render(token_list)
 }
 
+/// Translate every RELATIVE reference in a shared-formula master's token list
+/// by a fixed (col, row) offset, producing the concrete formula for a consumer
+/// cell.
+///
+/// This differs from [`adjustment_insert_formula_coordinate`], which has
+/// row/column *insertion* semantics (it only shifts references at or after an
+/// insertion root). A shared-formula consumer must translate ALL of its
+/// relative references by the same offset -- including references that
+/// point above or to the left of the master cell. Using the insertion
+/// adjustment here left such references frozen (for example `=A6-A5` shared
+/// from master `B6` expanded to `A7-A5` at `B7` instead of `A7-A6`). Absolute
+/// (`$`-locked) row/column parts are left unchanged.
+pub fn adjustment_shared_formula_coordinate(
+    token_list: &mut [FormulaToken],
+    offset_col_num: u32,
+    offset_row_num: u32,
+) -> String {
+    for token in token_list.iter_mut() {
+        if token.get_token_type() == &FormulaTokenTypes::Operand
+            && token.get_token_sub_type() == &FormulaTokenSubTypes::Range
+        {
+            let (sheet_name, range) = split_address(token.get_value());
+            let mut coordinate_list_new: Vec<String> = Vec::new();
+            let coordinate_list = get_split_range(range);
+            for coordinate in &coordinate_list {
+                let cell = index_from_coordinate(coordinate);
+                match (cell.0, cell.1) {
+                    // Full cell reference (e.g. A1, $A$1): translate both axes.
+                    (Some(mut col_num), Some(mut row_num)) => {
+                        let is_lock_col = cell.2.unwrap_or(false);
+                        let is_lock_row = cell.3.unwrap_or(false);
+                        if !is_lock_col {
+                            col_num += offset_col_num;
+                        }
+                        if !is_lock_row {
+                            row_num += offset_row_num;
+                        }
+                        coordinate_list_new.push(coordinate_from_index_with_lock(
+                            col_num,
+                            row_num,
+                            is_lock_col,
+                            is_lock_row,
+                        ));
+                    }
+                    // Whole-column reference (e.g. the `A` in `A:A`): translate the column only.
+                    (Some(mut col_num), None) => {
+                        let is_lock_col = cell.2.unwrap_or(false);
+                        if !is_lock_col {
+                            col_num += offset_col_num;
+                        }
+                        let lock = if is_lock_col { "$" } else { "" };
+                        coordinate_list_new
+                            .push(format!("{lock}{}", string_from_column_index(col_num)));
+                    }
+                    // Whole-row reference (e.g. the `1` in `1:1`): translate the row only.
+                    (None, Some(mut row_num)) => {
+                        let is_lock_row = cell.3.unwrap_or(false);
+                        if !is_lock_row {
+                            row_num += offset_row_num;
+                        }
+                        let lock = if is_lock_row { "$" } else { "" };
+                        coordinate_list_new.push(format!("{lock}{row_num}"));
+                    }
+                    // Not a coordinate we recognise (defined name, etc.): leave untouched.
+                    (None, None) => {
+                        coordinate_list_new.push((*coordinate).to_string());
+                    }
+                }
+            }
+            let new_value = join_address(sheet_name, &get_join_range(&coordinate_list_new));
+            token.set_value(new_value);
+        }
+    }
+    render(token_list)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn adjustment_remove_formula_coordinate(
     token_list: &mut [FormulaToken],
@@ -1059,6 +1136,60 @@ mod tests {
         assert_eq!(
             format!("={}", render(parse_to_tokens(formula).as_ref())),
             formula
+        );
+    }
+
+    #[test]
+    fn shared_formula_translates_all_relative_refs_including_above_master() {
+        // master `=A6-A5` at B6; consumer B7 is offset (col 0, row +1).
+        // Every relative ref must translate: A6->A7 AND A5->A6 -- the above-master ref
+        // must NOT freeze.
+        let mut t = parse_to_tokens("=A6-A5");
+        assert_eq!(adjustment_shared_formula_coordinate(&mut t, 0, 1), "A7-A6");
+
+        // consumer B8, offset (0, +2): A6->A8, A5->A7
+        let mut t = parse_to_tokens("=A6-A5");
+        assert_eq!(adjustment_shared_formula_coordinate(&mut t, 0, 2), "A8-A7");
+
+        // column translation: `=B2-A2` offset (col +1, row 0) -> C2-B2
+        let mut t = parse_to_tokens("=B2-A2");
+        assert_eq!(adjustment_shared_formula_coordinate(&mut t, 1, 0), "C2-B2");
+
+        // absolute ($) parts stay locked: `=$A6-A$5` offset (col +1, row +1):
+        //   $A6 -> locked col A, relative row 6->7 => $A7 ; A$5 -> relative col A->B,
+        // locked row 5 => B$5
+        let mut t = parse_to_tokens("=$A6-A$5");
+        assert_eq!(
+            adjustment_shared_formula_coordinate(&mut t, 1, 1),
+            "$A7-B$5"
+        );
+
+        // whole-column reference shifts on a column fill: SUM(A:A) offset (col +1, row
+        // 0) -> SUM(B:B)
+        let mut t = parse_to_tokens("=SUM(A:A)");
+        assert_eq!(
+            adjustment_shared_formula_coordinate(&mut t, 1, 0),
+            "SUM(B:B)"
+        );
+        // ...and is unaffected by a row fill: SUM(A:A) offset (0, +5) -> SUM(A:A)
+        let mut t = parse_to_tokens("=SUM(A:A)");
+        assert_eq!(
+            adjustment_shared_formula_coordinate(&mut t, 0, 5),
+            "SUM(A:A)"
+        );
+        // locked whole column stays put: SUM($A:$A) offset (col +1, row 0) ->
+        // SUM($A:$A)
+        let mut t = parse_to_tokens("=SUM($A:$A)");
+        assert_eq!(
+            adjustment_shared_formula_coordinate(&mut t, 1, 0),
+            "SUM($A:$A)"
+        );
+        // whole-row reference shifts on a row fill: SUM(1:1) offset (col 0, row +1) ->
+        // SUM(2:2)
+        let mut t = parse_to_tokens("=SUM(1:1)");
+        assert_eq!(
+            adjustment_shared_formula_coordinate(&mut t, 0, 1),
+            "SUM(2:2)"
         );
     }
 }
