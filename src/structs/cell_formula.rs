@@ -19,6 +19,7 @@ use crate::{
             FormulaToken,
             adjustment_insert_formula_coordinate,
             adjustment_remove_formula_coordinate,
+            adjustment_shared_formula_coordinate,
             parse_to_tokens,
         },
     },
@@ -321,21 +322,22 @@ impl CellFormula {
                     let self_col_num = self_cell.0.unwrap();
                     let self_row_num = self_cell.1.unwrap();
 
-                    let root_col_num = parent_col_num;
-                    let root_row_num = parent_row_num;
-                    let offset_col_num = self_col_num - root_col_num;
-                    let offset_row_num = self_row_num - parent_row_num;
+                    // The master is the top-left cell of the shared range, so a valid consumer is
+                    // always at or below/right of it; saturating_sub avoids an unsigned wraparound
+                    // if a malformed file presents a consumer above/left of the master.
+                    let offset_col_num = self_col_num.saturating_sub(parent_col_num);
+                    let offset_row_num = self_row_num.saturating_sub(parent_row_num);
 
                     let mut token_new = token.clone();
-                    let value = adjustment_insert_formula_coordinate(
+                    // A shared-formula consumer translates EVERY relative reference by its offset
+                    // from the master, including references above/left of the master. The prior use
+                    // of `adjustment_insert_formula_coordinate` (row/col-insertion semantics) froze
+                    // above-master references, e.g. `=A6-A5` at master B6 expanded to `A7-A5`
+                    // instead of `A7-A6` at B7.
+                    let value = adjustment_shared_formula_coordinate(
                         &mut token_new,
-                        root_col_num,
                         offset_col_num,
-                        root_row_num,
                         offset_row_num,
-                        "",
-                        "",
-                        true,
                     );
                     self.text_view.set_value(value);
                 }
